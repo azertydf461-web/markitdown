@@ -5,9 +5,11 @@
 в зеркальной структуре папок в выходном каталоге. Исходные файлы не изменяются.
 Всё выполняется локально: без LLM и облачных сервисов, в интернет ничего не отправляется.
 
+    python vsl_docs_to_md.py           конвертация с распознаванием сканов (повторный запуск — только новые/изменённые)
     python vsl_docs_to_md.py --scan    инвентаризация без конвертации
-    python vsl_docs_to_md.py           конвертация (повторный запуск обрабатывает только новые и изменённые файлы)
-    python vsl_docs_to_md.py --ocr     то же + распознавание сканов (нужны языковые файлы Tesseract)
+
+Чертежи и схемы (DWG/DXF, крупноформатные PDF/TIFF, файлы в папках «Чертежи», «Схемы», «Drawings»)
+оформляются карточкой: ссылка на оригинал, превью листа и все надписи с чертежа (штамп, позиции, примечания).
 
 Подробности в README.md.
 """
@@ -17,6 +19,7 @@ import csv
 import datetime as dt
 import email
 import email.policy
+import glob
 import io
 import multiprocessing as mp
 import os
@@ -90,20 +93,35 @@ LEGACY_EXT = {
     ".ods": ".xlsx",
 }
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".gif"}
+CAD_EXT = {".dwg", ".dxf"}
 CODE_EXT = {".xml": "xml", ".log": "", ".ini": "ini", ".cfg": "", ".conf": ""}
 SKIP_NAMES = {"thumbs.db", "desktop.ini", ".ds_store"}
+
+# Признаки чертежа: слово в пути или лист формата A2 и крупнее (длинная сторона ≥ ~565 мм)
+DRAWING_WORDS = ("чертеж", "чертёж", "схем", "drawing", "dwg", "p&id", "diagram")
+LARGE_SHEET_PT = 1600
+PREVIEW_PX = 1600
+OCR_MAX_PIXELS = 40e6  # ограничение для OCR листов A1/A0, иначе медленно и много памяти
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TESSDATA_URLS = (
+    "https://github.com/tesseract-ocr/tessdata_best/raw/main/{}.traineddata",
+    "https://github.com/tesseract-ocr/tessdata_fast/raw/main/{}.traineddata",
+)
 
 NO_PASSWORD = "vsl2md-no-password"  # подставляется, чтобы защищённые паролем файлы не вешали Office диалогом
 
 STATUS_HELP = {
     "OK": "сконвертировано",
     "OCR": "сконвертировано с распознаванием сканов",
-    "LOW_TEXT": "есть страницы-сканы без текстового слоя: запустить с --ocr",
+    "DRAWING": "чертёж/схема: карточка с превью и надписями",
+    "DRAWING_NO_TEXT": "DWG без ODA File Converter: карточка без надписей",
+    "LOW_TEXT": "сканы не распознаны: OCR был недоступен (см. начало вывода)",
     "NO_TEXT": "изображение без распознаваемого текста",
     "UNCHANGED": "уже сконвертировано ранее, исходник не менялся",
-    "NEEDS_OCR": "изображение: конвертируется только с --ocr",
+    "NEEDS_OCR": "изображение не обработано: OCR был недоступен",
     "NO_CONVERTER": "старый формат Office: нужен MS Office (pywin32) или LibreOffice",
-    "UNSUPPORTED": "формат не поддерживается (чертежи, архивы rar/7z, видео и т.п.)",
+    "UNSUPPORTED": "формат не поддерживается (архивы rar/7z, видео, аудио и т.п.)",
     "TOO_LARGE": "файл больше --max-size-mb",
     "ERROR": "ошибка конвертации (см. колонку message)",
     "TIMEOUT": "превышен лимит времени --timeout",
@@ -209,10 +227,57 @@ def has_pywin32():
         return False
 
 
-def find_tessdata(user_value):
+def find_oda():
+    p = shutil.which("ODAFileConverter")
+    if p:
+        return p
+    for base in (r"C:\Program Files\ODA", r"C:\Program Files (x86)\ODA"):
+        found = sorted(
+            glob.glob(os.path.join(base, "ODAFileConverter*", "ODAFileConverter.exe"))
+        )
+        if found:
+            return found[-1]
+    return None
+
+
+def ensure_tessdata(user_value, langs):
+    """Папка с языковыми файлами OCR; если их нет — скачиваются рядом со скриптом."""
+    d = find_tessdata(user_value, langs)
+    if d:
+        return d, ""
+    import urllib.request
+
+    target = os.path.join(SCRIPT_DIR, "tessdata")
+    os.makedirs(target, exist_ok=True)
+    for lang in langs:
+        dst = os.path.join(target, f"{lang}.traineddata")
+        if os.path.isfile(dst):
+            continue
+        err = ""
+        for url in TESSDATA_URLS:
+            print(f"Скачиваю языковой файл OCR {lang}.traineddata ...", flush=True)
+            try:
+                with urllib.request.urlopen(url.format(lang), timeout=180) as r, open(
+                    dst + ".part", "wb"
+                ) as f:
+                    shutil.copyfileobj(r, f)
+                os.replace(dst + ".part", dst)
+                break
+            except Exception as e:
+                err = f"{type(e).__name__}: {e}"
+                try:
+                    os.remove(dst + ".part")
+                except OSError:
+                    pass
+        else:
+            return None, f"не удалось скачать {lang}.traineddata ({err})"
+    return target, ""
+
+
+def find_tessdata(user_value, langs):
     candidates = [user_value, os.environ.get("TESSDATA_PREFIX")]
     candidates += [
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "tessdata"),
+        os.path.join(SCRIPT_DIR, "tessdata"),
         r"C:\Program Files\Tesseract-OCR\tessdata",
         r"C:\Program Files (x86)\Tesseract-OCR\tessdata",
         os.path.expandvars(r"%LOCALAPPDATA%\Programs\Tesseract-OCR\tessdata"),
@@ -223,7 +288,9 @@ def find_tessdata(user_value):
         "/usr/local/share/tessdata",
     ]
     for c in candidates:
-        if c and os.path.isdir(c):
+        if c and all(
+            os.path.isfile(os.path.join(c, f"{l}.traineddata")) for l in langs
+        ):
             return c
     return None
 
@@ -430,6 +497,10 @@ class FileConverter:
 
     def convert(self, job):
         kind, src, ext = job["kind"], job["src"], job["ext"]
+        if kind == "native" and ext == ".pdf":
+            drawing = self.drawing_pdf(job)
+            if drawing is not None:
+                return drawing
         if kind == "native":
             try:
                 body = self.markitdown(src, EXT_ALIAS.get(ext))
@@ -446,7 +517,11 @@ class FileConverter:
             body, method = self.via_legacy(src, LEGACY_EXT[ext])
             return body, {"status": "OK", "method": method}
         if kind == "image":
+            if is_drawing_path(job["rel"]):
+                return self.drawing_image(job)
             return self.ocr_image(src)
+        if kind == "cad":
+            return self.cad(job)
         if kind == "eml":
             return self.eml(src), {"status": "OK", "method": "email"}
         if kind == "code":
@@ -524,18 +599,138 @@ class FileConverter:
             info,
         )
 
+    def ocr_page(self, page):
+        # Большие листы распознаются с меньшим dpi, чтобы уложиться в OCR_MAX_PIXELS
+        area_in2 = (page.rect.width / 72) * (page.rect.height / 72)
+        dpi = min(self.opts["ocr_dpi"], int((OCR_MAX_PIXELS / area_in2) ** 0.5))
+        tp = page.get_textpage_ocr(
+            language=self.opts["ocr_lang"],
+            dpi=max(dpi, 150),
+            full=True,
+            tessdata=self.opts["tessdata"],
+        )
+        return fix_homoglyphs(page_text(page, tp))
+
     def ocr_pages(self, doc, indexes):
-        out = []
-        for i in indexes:
-            page = doc[i]
-            tp = page.get_textpage_ocr(
-                language=self.opts["ocr_lang"],
-                dpi=self.opts["ocr_dpi"],
-                full=True,
-                tessdata=self.opts["tessdata"],
+        return [(i, self.ocr_page(doc[i])) for i in indexes]
+
+    # -- чертежи и схемы ----------------------------------------------------
+    def drawing_pdf(self, job):
+        """Карточка чертежа для PDF, либо None, если это обычный документ."""
+        try:
+            import pymupdf
+        except ImportError:
+            return None
+        with open_doc(pymupdf, job["src"]) as doc:
+            if doc.needs_pass or doc.page_count == 0:
+                return None
+            large = sum(
+                1 for p in doc if max(p.rect.width, p.rect.height) >= LARGE_SHEET_PT
             )
-            out.append((i, page.get_text("text", textpage=tp).strip()))
-        return out
+            if not (is_drawing_path(job["rel"]) or large * 2 >= doc.page_count):
+                return None
+            return self.drawing_card(doc, job, "PDF")
+
+    def drawing_image(self, job):
+        import pymupdf
+
+        with open_doc(pymupdf, job["src"]) as img:
+            pdf_bytes = img.convert_to_pdf()
+        with pymupdf.open("pdf", pdf_bytes) as doc:
+            return self.drawing_card(doc, job, "изображение")
+
+    def drawing_card(self, doc, job, source_kind):
+        sheets, ocr_done, ocr_missing = [], [], []
+        for i, page in enumerate(doc):
+            text = page_text(page)
+            if len(text) < self.opts["min_chars"] and page.get_images():
+                if self.opts["ocr"]:
+                    text = self.ocr_page(page)
+                    ocr_done.append(i)
+                else:
+                    ocr_missing.append(i)
+            sheets.append(text)
+        preview = self.save_preview(doc[0], job)
+        lines = [drawing_notice(job), ""]
+        if preview:
+            title = "Превью листа 1" if len(sheets) > 1 else "Превью"
+            lines += [f"![{title}](<{preview}>)", ""]
+        for i, text in enumerate(sheets):
+            head = "## Надписи на чертеже" if len(sheets) == 1 else f"## Лист {i + 1}"
+            if i in ocr_done:
+                head += " (OCR)"
+            lines += [head, "", text or "_(надписи не найдены)_", ""]
+        info = {
+            "status": "LOW_TEXT" if ocr_missing else "DRAWING",
+            "method": f"чертёж, {source_kind}"
+            + (", OCR" if ocr_done else ", текстовый слой"),
+            "pages": len(sheets),
+        }
+        if ocr_done:
+            info["note"] = f"OCR листов {page_ranges(ocr_done)}"
+        if ocr_missing:
+            info["note"] = f"не распознаны листы {page_ranges(ocr_missing)}"
+        return "\n".join(lines), info
+
+    def save_preview(self, page, job):
+        import pymupdf
+
+        try:
+            zoom = PREVIEW_PX / max(page.rect.width, page.rect.height)
+            pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), alpha=False)
+            name = os.path.basename(job["dst"])[: -len(".md")] + ".preview.jpg"
+            os.makedirs(os.path.dirname(job["dst"]), exist_ok=True)
+            with open(os.path.join(os.path.dirname(job["dst"]), name), "wb") as f:
+                f.write(pix.tobytes("jpg", jpg_quality=70))
+            return name
+        except Exception:
+            return None
+
+    def cad(self, job):
+        src, ext = job["src"], job["ext"]
+        oda = self.opts["oda"]
+        if ext == ".dwg" and not oda:
+            body = (
+                drawing_notice(job)
+                + "\n\n_Надписи из DWG не извлечены: на компьютере не установлен"
+                " бесплатный ODA File Converter._"
+            )
+            return body, {"status": "DRAWING_NO_TEXT", "method": "чертёж, DWG"}
+        import ezdxf
+
+        tmp = os.path.join(self.tmpdir, "cad" + ext)
+        shutil.copyfile(src, tmp)  # короткий путь для ODA и ezdxf
+        try:
+            if ext == ".dwg":
+                from ezdxf.addons import odafc
+
+                key = "win_exec_path" if IS_WIN else "unix_exec_path"
+                ezdxf.options.set("odafc-addon", key, oda)
+                doc = odafc.readfile(tmp)
+            else:
+                from ezdxf import recover
+
+                doc, _ = recover.readfile(tmp)
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        texts, seen = [], set()
+        for layout in [doc.modelspace()] + list(doc.layouts):
+            for e in layout:
+                for t in cad_entity_texts(e):
+                    t = " ".join(t.split())
+                    if t and t not in seen:
+                        seen.add(t)
+                        texts.append(t)
+        body = drawing_notice(job) + "\n\n## Надписи на чертеже\n\n"
+        body += "\n".join(texts) if texts else "_(надписи не найдены)_"
+        return body, {
+            "status": "DRAWING",
+            "method": f"чертёж, {ext.upper().lstrip('.')}",
+            "note": f"надписей: {len(texts)}",
+        }
 
     def ocr_image(self, src):
         import pymupdf
@@ -621,6 +816,71 @@ class FileConverter:
         with open(tmp, "w", encoding="utf-8", newline="\n") as f:
             f.write(text)
         os.replace(tmp, job["dst"])
+
+
+_CYR2LAT = str.maketrans("АВЕКМНОРСТХУаеорсух", "ABEKMHOPCTXYaeopcyx")
+_LAT2CYR = str.maketrans("ABEKMHOPCTXYaeopcyx", "АВЕКМНОРСТХУаеорсух")
+_CYR_ONLY = re.compile(r"[а-яёА-ЯЁ]")
+_LAT = re.compile(r"[A-Za-z]")
+
+
+def _fix_token(tok):
+    cyr = _CYR_ONLY.findall(tok)
+    if not cyr:
+        return tok
+    pure_cyr = [
+        c for c in cyr if c.translate(_CYR2LAT) == c
+    ]  # буквы без латинского двойника
+    if not _LAT.search(tok) and not any(ch.isdigit() for ch in tok):
+        return tok  # обычное русское слово
+    if pure_cyr:
+        return tok.translate(_LAT2CYR)  # русское слово с латинскими «двойниками»
+    return tok.translate(_CYR2LAT)  # код/номер: «СН-310-002» -> «CH-310-002»
+
+
+def fix_homoglyphs(text):
+    """OCR rus+eng путает похожие буквы в номерах чертежей и тегах; приводим к одной письменности."""
+    return re.sub(r"\S+", lambda m: _fix_token(m.group(0)), text)
+
+
+def page_text(page, textpage=None):
+    """Текст страницы по блокам, без позиционных пробелов."""
+    blocks = page.get_text("blocks", sort=True, textpage=textpage)
+    out = []
+    for b in blocks:
+        if b[6] != 0:
+            continue
+        lines = [" ".join(l.split()) for l in b[4].splitlines()]
+        lines = [l for l in lines if l]
+        if lines:
+            out.append("\n".join(lines))
+    return "\n\n".join(out)
+
+
+def is_drawing_path(rel):
+    low = rel.lower()
+    return any(w in low for w in DRAWING_WORDS)
+
+
+def drawing_notice(job):
+    return (
+        "> **Чертёж / схема.** Размеры, допуски и технические параметры брать только"
+        f" из оригинала: `{job['display_src']}`"
+    )
+
+
+def cad_entity_texts(e):
+    kind = e.dxftype()
+    try:
+        if kind in ("TEXT", "ATTRIB", "ATTDEF"):
+            yield e.dxf.text
+        elif kind == "MTEXT":
+            yield e.plain_text()
+        elif kind == "INSERT":
+            for a in e.attribs:
+                yield a.dxf.text
+    except Exception:
+        return
 
 
 def open_doc(pymupdf, path):
@@ -711,6 +971,8 @@ def classify(ext):
         return "legacy"
     if ext in IMAGE_EXT:
         return "image"
+    if ext in CAD_EXT:
+        return "cad"
     if ext == ".eml":
         return "eml"
     if ext in CODE_EXT:
@@ -783,6 +1045,7 @@ def do_scan(files, out_root, legacy_available, ocr, max_size):
         "native": "MarkItDown",
         "legacy": "через Office/LibreOffice",
         "image": "OCR изображения",
+        "cad": "чертёж DWG/DXF",
         "eml": "письмо .eml",
         "code": "текст/XML",
         None: "не поддерживается",
@@ -793,7 +1056,11 @@ def do_scan(files, out_root, legacy_available, ocr, max_size):
         if kind == "legacy" and not legacy_available:
             label = "НЕТ конвертера .doc/.ppt"
         if kind == "image" and not ocr:
-            label = "изображение: только --ocr"
+            label = "изображение: OCR недоступен"
+        if kind == "image" and is_drawing_path(f["rel"]):
+            label = "чертёж (изображение)"
+        if kind == "native" and f["ext"] == ".pdf" and is_drawing_path(f["rel"]):
+            label = "чертёж (PDF)"
         if f["size"] > max_size:
             label = "больше --max-size-mb"
         key = (f["vessel"], f["ext"] or "(без расширения)", label)
@@ -869,8 +1136,10 @@ def build_index(out_root):
         extra = []
         if fm.get("pages"):
             extra.append(f"{fm['pages']} стр.")
+        if fm.get("status", "").startswith("drawing"):
+            extra.insert(0, "чертёж")
         if fm.get("status") == "low_text":
-            extra.append("нужен OCR: " + fm.get("note", ""))
+            extra.append("сканы не распознаны: " + fm.get("note", ""))
         suffix = f" — {'; '.join(extra)}" if extra else ""
         lines.append(f"- [{parts[-1][:-3]}](<{rel}>){suffix}")
     with open(
@@ -901,10 +1170,11 @@ def parse_args():
         help="только инвентаризация: что и сколько будет обработано",
     )
     ap.add_argument(
-        "--ocr",
+        "--no-ocr",
         action="store_true",
-        help="распознавать сканы PDF и изображения (Tesseract через PyMuPDF)",
+        help="не распознавать сканы (по умолчанию распознаются)",
     )
+    ap.add_argument("--ocr", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--ocr-lang", default="rus+eng")
     ap.add_argument("--ocr-dpi", type=int, default=300)
     ap.add_argument("--tessdata", help="папка с rus.traineddata и eng.traineddata")
@@ -974,21 +1244,23 @@ def main():
     office = args.legacy in ("auto", "office") and has_pywin32()
     legacy_available = bool(soffice or office)
 
-    tessdata = None
+    oda = find_oda()
+    args.ocr, tessdata, ocr_problem = not args.no_ocr, None, ""
     if args.ocr:
         try:
             import pymupdf  # noqa: F401
+
+            tessdata, ocr_problem = ensure_tessdata(
+                args.tessdata, args.ocr_lang.split("+")
+            )
         except ImportError:
-            sys.exit("Для --ocr нужен пакет pymupdf: python -m pip install pymupdf")
-        tessdata = find_tessdata(args.tessdata)
-        langs = args.ocr_lang.split("+")
-        if not tessdata or any(
-            not os.path.isfile(os.path.join(tessdata, f"{l}.traineddata"))
-            for l in langs
-        ):
-            sys.exit(
-                f"Для --ocr не найдены языковые файлы {', '.join(l + '.traineddata' for l in langs)}. "
-                "Установите Tesseract с русским языком или укажите папку параметром --tessdata (см. README)."
+            ocr_problem = "не установлен пакет pymupdf (запустите install.bat)"
+        if ocr_problem:
+            args.ocr = False
+            print(
+                f"\n!!! OCR НЕДОСТУПЕН: {ocr_problem}.\n"
+                "!!! Сканы будут помечены LOW_TEXT/NEEDS_OCR; после устранения причины"
+                " просто запустите конвертацию ещё раз — будут обработаны только они.\n"
             )
 
     print("Источники:")
@@ -1002,6 +1274,9 @@ def main():
     )
     print(
         f"OCR: {'включён, ' + args.ocr_lang + ', ' + tessdata if args.ocr else 'выключен'}"
+    )
+    print(
+        f"DWG: {'ODA File Converter ' + oda if oda else 'нет ODA File Converter (только карточки)'}"
     )
 
     errors = []
@@ -1033,7 +1308,10 @@ def main():
             and os.path.getmtime(f["dst"]) >= f["mtime"]
         ):
             prev = read_front_matter(f["dst"]).get("status", "")
-            if not (args.ocr and prev == "low_text"):
+            redo = (args.ocr and prev == "low_text") or (
+                oda and prev == "drawing_no_text"
+            )
+            if not redo:
                 status = "UNCHANGED"
         if status:
             rows.append(
@@ -1062,6 +1340,7 @@ def main():
         "ocr_lang": args.ocr_lang,
         "ocr_dpi": args.ocr_dpi,
         "tessdata": tessdata,
+        "oda": oda,
         "min_chars": args.min_chars,
     }
     job_q, res_q = queue.Queue(), queue.Queue()

@@ -7,7 +7,7 @@ python --version >nul 2>&1 || (
   exit /b 1
 )
 python -m pip install --upgrade pip
-python -m pip install --upgrade "markitdown[pdf,docx,pptx,xlsx,xls,outlook]" pymupdf pywin32
+python -m pip install --upgrade "markitdown[pdf,docx,pptx,xlsx,xls,outlook]" pymupdf ezdxf pywin32
 echo.
-echo Done. Optional for scanned documents: run get_tessdata.bat
+echo Done. Now run convert.bat
 pause
